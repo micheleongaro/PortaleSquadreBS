@@ -1,0 +1,152 @@
+rules_version = '2';
+
+// Regole di sicurezza del Portale Squadre.
+// Copia tutto questo testo in Firebase Console → Firestore Database → Regole → Pubblica.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Funzioni di supporto ----------
+    function signedIn() { return request.auth != null; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function isAdmin() { return verified() && request.auth.token.email == 'michele.ongaro@gmail.com'; }
+    function userData(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function isApproved() {
+      return verified()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && userData(request.auth.uid).status == 'approved';
+    }
+    function teamData(id) { return get(/databases/$(database)/documents/teams/$(id)).data; }
+    function isOrg(id) { return id != null && request.auth.uid in teamData(id).organizers; }
+    function isMember(id) { return id != null && request.auth.uid in teamData(id).members; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function canEditFor(uid) {
+      return request.auth.uid == uid || request.auth.uid in userData(uid).get('delegates', []);
+    }
+
+    // ---------- Username unici ----------
+    match /usernames/{name} {
+      allow get: if true;            // serve a controllare se lo username è libero
+      allow list: if false;
+      allow create: if signedIn()
+        && name.matches('^[a-z0-9]{8,20}$')
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.usernameLower == name;
+      allow delete: if isAdmin();
+    }
+
+    // ---------- Utenti ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isApproved() || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['username', 'usernameLower', 'status', 'emailVerified', 'avatar', 'delegates', 'createdAt', 'lastSeen'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.emailVerified == false
+        && request.resource.data.username.matches('^[A-Za-z0-9]{8,20}$')
+        && request.resource.data.usernameLower == request.resource.data.username.lower()
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.usernameLower)).data.uid == uid;
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && changed().hasOnly(['avatar', 'lastSeen', 'delegates', 'emailVerified'])
+            && (!('emailVerified' in changed())
+                || (request.resource.data.emailVerified == true && request.auth.token.email_verified == true)));
+      allow delete: if isAdmin();
+
+      // Email e telefono: visibili solo al proprietario e all'amministratore
+      match /private/{docId} {
+        allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+        allow create, update: if signedIn() && request.auth.uid == uid;
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ---------- Disponibilità ----------
+    function validSlot(d) {
+      return d.type in ['recurring', 'specific']
+        && d.start is string && d.end is string && d.start < d.end
+        && (d.type == 'specific' || (d.weekday is int && d.weekday >= 0 && d.weekday <= 6));
+    }
+    match /availability/{id} {
+      allow read: if isApproved();
+      allow create: if isApproved() && canEditFor(request.resource.data.uid) && validSlot(request.resource.data);
+      allow update: if isApproved() && canEditFor(resource.data.uid)
+        && request.resource.data.uid == resource.data.uid && validSlot(request.resource.data);
+      allow delete: if isAdmin() || (isApproved() && canEditFor(resource.data.uid));
+    }
+
+    // ---------- Squadre ----------
+    match /teams/{id} {
+      allow read: if isApproved() || isAdmin();
+      allow create: if isApproved()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.organizers == [request.auth.uid]
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 30;
+      allow update: if isAdmin()
+        // l'organizzatore gestisce nome, stemma e membri, ma non gli organizzatori
+        || (isApproved() && request.auth.uid in resource.data.organizers
+            && request.resource.data.organizers == resource.data.organizers
+            && request.resource.data.createdBy == resource.data.createdBy
+            && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 30)
+        // un membro può solo uscire dalla squadra
+        || (isApproved() && request.auth.uid in resource.data.members
+            && changed().hasOnly(['members', 'organizers'])
+            && request.resource.data.members.toSet() == resource.data.members.toSet().difference([request.auth.uid].toSet())
+            && request.resource.data.organizers.toSet() == resource.data.organizers.toSet().difference([request.auth.uid].toSet()));
+      allow delete: if isAdmin() || (isApproved() && request.auth.uid in resource.data.organizers);
+    }
+
+    // ---------- Partite ----------
+    function completedOk() {
+      return request.resource.data.status != 'completed'
+        || request.resource.data.type == 'external'
+        || (request.resource.data.get('reportA', null) != null
+            && request.resource.data.get('reportA', null) == request.resource.data.get('reportB', null)
+            && request.resource.data.get('winner', null) == request.resource.data.get('reportA', null));
+    }
+    match /matches/{id} {
+      allow read: if isApproved() || isAdmin();
+      allow create: if isApproved()
+        && request.resource.data.proposedBy == request.auth.uid
+        && request.resource.data.type in ['challenge', 'external']
+        && isMember(request.resource.data.teamA)
+        && (request.resource.data.type == 'external'
+            || (request.resource.data.teamB is string && request.resource.data.teamB != request.resource.data.teamA))
+        && (request.resource.data.status == 'proposed'
+            || (isOrg(request.resource.data.teamA)
+                && request.resource.data.organizedBy == request.auth.uid
+                && ((request.resource.data.type == 'challenge' && request.resource.data.status == 'challenged')
+                    || (request.resource.data.type == 'external' && request.resource.data.status == 'scheduled'))));
+      allow update: if isAdmin()
+        // organizzatore della squadra che lancia la partita
+        || (isApproved() && isOrg(resource.data.teamA)
+            && request.resource.data.teamA == resource.data.teamA
+            && request.resource.data.teamB == resource.data.teamB
+            && request.resource.data.type == resource.data.type
+            && !('reportB' in changed()) && !('acceptedBy' in changed())
+            && !(resource.data.type == 'challenge' && ('playersA' in changed() || 'playersB' in changed()))
+            && !(resource.data.type == 'challenge' && request.resource.data.status == 'scheduled' && resource.data.status != 'scheduled')
+            && completedOk())
+        // organizzatore della squadra sfidata
+        || (isApproved() && resource.data.type == 'challenge' && isOrg(resource.data.teamB)
+            && changed().hasOnly(['status', 'acceptedBy', 'playersA', 'playersB', 'reportB', 'winner', 'updatedAt'])
+            && completedOk())
+        // chi ha proposto può ritirare la propria proposta
+        || (isApproved() && resource.data.proposedBy == request.auth.uid && resource.data.status == 'proposed'
+            && changed().hasOnly(['status', 'updatedAt']) && request.resource.data.status == 'cancelled');
+      allow delete: if isAdmin();
+    }
+
+    // ---------- Appelli ----------
+    match /appeals/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isApproved()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.text is string && request.resource.data.text.size() <= 500;
+      allow update, delete: if isAdmin();
+    }
+  }
+}
